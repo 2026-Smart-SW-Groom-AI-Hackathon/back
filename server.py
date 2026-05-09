@@ -144,10 +144,11 @@ COOLDOWN_FRAMES        = 72      # 자동 캡처 후 3초 락
 # 시간축 안정화: 최근 N개 측정값으로 중앙값/평균 계산
 SMOOTH_WINDOW = 8
 _smooth = {
-    "forehead_mm": deque(maxlen=SMOOTH_WINDOW),
+    "forehead_mm":    deque(maxlen=SMOOTH_WINDOW),
     "forehead_ratio": deque(maxlen=SMOOTH_WINDOW),
-    "m_index": deque(maxlen=SMOOTH_WINDOW),
-    "hci": deque(maxlen=SMOOTH_WINDOW),
+    "m_index":        deque(maxlen=SMOOTH_WINDOW),
+    "hci":            deque(maxlen=SMOOTH_WINDOW),
+    "recession":      deque(maxlen=SMOOTH_WINDOW),
 }
 
 # 세그멘터 결과 캐시: 매 N프레임마다만 추론 (가장 무거운 연산 절감)
@@ -252,18 +253,16 @@ def save_measurement(detection: dict, frame: np.ndarray = None, ts: float = None
     record = {
         "ts":              round(ts, 3),
         "image":           image_fname,
+        # 측정값
         "hci":             _pick(detection, "hci_smooth",            "hci"),
         "forehead_mm":     _pick(detection, "forehead_mm_smooth",    "forehead_mm"),
         "forehead_px":     detection.get("forehead_px"),
-        "forehead_ratio": _pick(detection, "forehead_ratio_smooth", "forehead_ratio"),
+        "forehead_ratio":  _pick(detection, "forehead_ratio_smooth", "forehead_ratio"),
         "m_index":         _pick(detection, "m_index_smooth",        "m_index"),
-        "m_only_label":    detection.get("m_only_label"),
-        "forehead_label":  detection.get("forehead_label"),
-        "m_label":         detection.get("m_label"),       # 종합 = 탈모 여부
-        "combined_score":  detection.get("combined_score"),
-        "combined_level":  detection.get("combined_level"),
-        "severity":        detection.get("severity"),
-        "severity_level":  detection.get("severity_level"),
+        "recession_ratio": _pick(detection, "recession_smooth",      "recession_ratio"),
+        # 단일 분류 결과 (탈모 여부)
+        "label":           detection.get("m_label"),
+        "level":           detection.get("combined_level"),
     }
     with open(MEASUREMENTS_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -294,13 +293,12 @@ def load_history(limit: int = HISTORY_LIMIT, with_thumbs: bool = True) -> list:
             it["thumb"] = make_thumb_b64(it.get("image", ""))
     return items
 
-# ── 탈모 심각도 임계값 (forehead / lower_face 비율) ────────────────────────
-# 정상 얼굴: 헤어라인→눈썹 ≈ (눈썹→턱)/2  →  ratio ≈ 0.5
-SEVERITY_BANDS = [
-    (0.55, "정상",   0, (0, 255, 120)),
-    (0.70, "경증",   1, (0, 220, 255)),
-    (0.85, "중등도", 2, (0, 140, 255)),
-    (99.0, "심각",   3, (0, 60, 255)),
+# ── 탈모 색상 (4단계) ────────────────────────────────────────────────────
+LEVEL_COLORS = [
+    (0, 255, 120),   # 0 정상
+    (0, 220, 255),   # 1 경증
+    (0, 140, 255),   # 2 중등도
+    (0,  60, 255),   # 3 심각
 ]
 
 # ── 색상 ────────────────────────────────────────────────────────────────────
@@ -311,87 +309,49 @@ CLR_BAD      = (0, 80, 255)
 CLR_HAIRLINE_GLOW = (0, 200, 160)
 
 
-def classify_severity(ratio: float):
-    for thr, label, level, color in SEVERITY_BANDS:
-        if ratio < thr:
-            return label, level, color
-    return SEVERITY_BANDS[-1][1], SEVERITY_BANDS[-1][2], SEVERITY_BANDS[-1][3]
-
-
-def classify_m_only(m_index):
-    """M자 지수 단독 판단."""
-    if m_index is None:
-        return "—", -1
-    if m_index < 0.05:   return "정상", 0
-    if m_index < 0.15:   return "경증", 1
-    if m_index < 0.30:   return "중등도", 2
-    return "심각", 3
-
-
-def classify_forehead_only(forehead_ratio):
-    """이마 비율 단독 판단 (rule of thirds: 0.50이 정상)."""
-    if forehead_ratio is None:
-        return "—", -1
-    overall = max(0.0, forehead_ratio - 0.50)
-    if overall < 0.03:   return "정상", 0       # ratio < 0.53
-    if overall < 0.10:   return "경증", 1       # ratio < 0.60
-    if overall < 0.20:   return "중등도", 2      # ratio < 0.70
-    return "심각", 3
-
-
-def classify_combined(m_index, forehead_ratio):
+def classify_baldness(m_index, forehead_ratio, hci):
     """
-    M자 지수 + 이마 비율 종합 판단.
+    탈모 분류 — 3가지 독립 신호 중 가장 심한 것으로 판단.
 
-    score = m_index × 1.5 + max(0, forehead_ratio − 0.50) × 2.5
-        - M자(측두부 비대칭 후퇴)와 전반적 이마 후퇴 모두 강하게 반영
-        - 이마 비율이 평균(0.50)보다 큰 만큼 가중 가산
-        - 이마만 길어도 탈모 신호로 명확히 잡힘
+    신호 1) 헤어라인 진폭 (m_index)
+        - 헤어라인이 일자에 가까울수록 정상 (격차 작음)
+        - 격차가 클수록 탈모 신호 (M자, 비대칭 후퇴 등)
 
-    레벨:
-        score < 0.05 → 정상
-        < 0.15 → 경증
-        < 0.30 → 중등도
-        ≥ 0.30 → 심각
+    신호 2) 이마 비율 (forehead_ratio)
+        - rule of thirds로 정상 ≈ 0.50
+        - 클수록 이마가 넓음 = 전반적 후퇴
 
-    예시:
-        forehead_ratio=0.55 (살짝 긴 이마)        → 0.05×2.5 = 0.125 → 경증
-        forehead_ratio=0.60 (꽤 긴 이마)          → 0.10×2.5 = 0.25  → 중등도
-        forehead_ratio=0.65                       → 0.15×2.5 = 0.375 → 심각
-        m_index=0.20, ratio=0.50 (M자만)          → 0.20×1.5 = 0.30  → 심각 M자
-        m_index=0.10, ratio=0.60 (둘 다)          → 0.15+0.25 = 0.40 → 심각
+    신호 3) 두피 노출 (HCI)
+        - HCI 낮을수록 머리카락 영역에 두피가 많이 노출됨
+        - 광범위 탈모 / 대머리 잡기 위함
 
-    우세 패턴 접미사 (레벨 1+):
-        m_index > overall_recession + 0.03 → " M자"
-        overall_recession > m_index + 0.03 → " 이마후퇴"
+    각 신호를 0~3으로 분류 후 max() → 최종 레벨.
     """
-    if m_index is None and forehead_ratio is None:
-        return "—", -1, None
+    levels = []
 
-    m  = m_index if m_index is not None else 0.0
-    fr = forehead_ratio if forehead_ratio is not None else 0.50
-    overall = max(0.0, fr - 0.50)
-    score = m * 1.5 + overall * 2.5
+    if m_index is not None:
+        if   m_index < 0.10: levels.append(0)
+        elif m_index < 0.20: levels.append(1)
+        elif m_index < 0.35: levels.append(2)
+        else:                levels.append(3)
 
-    if score < 0.05:
-        base, lvl = "정상", 0
-    elif score < 0.15:
-        base, lvl = "경증", 1
-    elif score < 0.30:
-        base, lvl = "중등도", 2
-    else:
-        base, lvl = "심각", 3
+    if forehead_ratio is not None:
+        if   forehead_ratio < 0.55: levels.append(0)
+        elif forehead_ratio < 0.65: levels.append(1)
+        elif forehead_ratio < 0.78: levels.append(2)
+        else:                       levels.append(3)
 
-    if lvl == 0:
-        return base, lvl, round(score, 3)
+    if hci is not None:
+        if   hci > 0.75: levels.append(0)
+        elif hci > 0.55: levels.append(1)
+        elif hci > 0.35: levels.append(2)
+        else:            levels.append(3)   # HCI < 0.35 = 대머리
 
-    if m > overall + 0.03:
-        suffix = " M자"
-    elif overall > m + 0.03:
-        suffix = " 이마후퇴"
-    else:
-        suffix = ""
-    return base + suffix, lvl, round(score, 3)
+    if not levels:
+        return "—", -1
+
+    lvl = max(levels)
+    return ["정상", "경증", "중등도", "심각"][lvl], lvl
 
 
 def get_px(lm, w, h):
@@ -570,26 +530,28 @@ def process_frame(frame: np.ndarray, frame_idx: int, live_only: bool = True):
         forehead_px    = max(0.0, eyebrow_y - hairline_y) if hairline_y is not None else 0.0
         lower_face_px  = max(1.0, chin_y - eyebrow_y)
         ratio          = forehead_px / lower_face_px if hairline_y is not None else None
-        sev_label, sev_level, sev_color = (
-            classify_severity(ratio) if ratio is not None else ("--", -1, (120, 120, 120))
-        )
 
-        # ── M자 지수: 측두부 vs 중앙 헤어라인 높이 차 (face_height 정규화) ──
-        # 음수 또는 0 ≈ 정상,  +0.10 이상 = M자 의심,  +0.30 이상 = 뚜렷한 M자
-        left_t_ys  = [p[1] for p in final_hairline if p[0] < lb_ctr[0]]
-        right_t_ys = [p[1] for p in final_hairline if p[0] > rb_ctr[0]]
-        center_ys  = [p[1] for p in final_hairline
-                      if lb_ctr[0] <= p[0] <= rb_ctr[0]]
+        # ── 단일 탈모 metric: 헤어라인 최대 후퇴 비율 ─────────────────────
+        # = (눈썹 → 헤어라인 최상단) / (눈썹 → 턱)
+        # rule of thirds로 정상은 ~0.50, 후퇴할수록 증가
+        # 5th percentile 사용 → 노이즈 점 1~2개에 휘둘리지 않음
+        recession_ratio = None
+        if final_hairline and lower_face_px > 1:
+            top_y = float(np.percentile([p[1] for p in final_hairline], 5))
+            recession_ratio = round(max(0.0, eyebrow_y - top_y) / lower_face_px, 3)
 
+        # ── M자 수치: 헤어라인 진폭 (단순 표시용, 분류엔 미사용) ──────────
         m_index = None
-        if left_t_ys and right_t_ys and center_ys and face_height > 0:
-            avg_temple = (float(np.mean(left_t_ys)) + float(np.mean(right_t_ys))) / 2.0
-            avg_center = float(np.mean(center_ys))
-            m_index = round((avg_center - avg_temple) / face_height, 3)
+        if final_hairline and face_height > 0:
+            ys_sorted = sorted([p[1] for p in final_hairline])
+            n = len(ys_sorted)
+            n_p = max(1, n // 10)
+            y_high = float(np.mean(ys_sorted[:n_p]))
+            y_low  = float(np.mean(ys_sorted[-n_p:]))
+            m_index = round((y_low - y_high) / face_height, 3)
 
-        # 임시 라벨 — 평활화 후 종합 판단으로 덮어씀
+        # 임시 — 평활화 후 분류
         m_label = "—"
-        combined_score = None
         combined_level = -1
 
         # ── 카메라 거리 보정: IPD(동공간 거리)로 px → mm 환산 ──────────
@@ -628,21 +590,29 @@ def process_frame(frame: np.ndarray, frame_idx: int, live_only: bool = True):
         cv2.ellipse(frame, (g_cx, g_cy), (g_rx, g_ry),
                     0, 0, 360, guide_color, 2, cv2.LINE_AA)
 
-        # ── 시간축 평활화: deque에 raw 값 push → 중앙값 반환 ────────────
+        # ── 시간축 평활화 ────────────────────────────────────────────────
         sm_forehead_mm    = smooth_push("forehead_mm",    forehead_mm)
         sm_forehead_ratio = smooth_push("forehead_ratio", ratio)
         sm_m_index        = smooth_push("m_index",        m_index)
         sm_hci            = smooth_push("hci",            hci)
+        sm_recession      = smooth_push("recession",      recession_ratio)
 
-        # 화면 배지에는 안정화된 값 사용
-        disp_ratio   = sm_forehead_ratio if sm_forehead_ratio is not None else ratio
-        disp_mm      = sm_forehead_mm    if sm_forehead_mm    is not None else forehead_mm
-        disp_m_index = sm_m_index        if sm_m_index        is not None else m_index
-        disp_hci     = sm_hci            if sm_hci            is not None else hci
+        disp_ratio     = sm_forehead_ratio if sm_forehead_ratio is not None else ratio
+        disp_mm        = sm_forehead_mm    if sm_forehead_mm    is not None else forehead_mm
+        disp_m_index   = sm_m_index        if sm_m_index        is not None else m_index
+        disp_hci       = sm_hci            if sm_hci            is not None else hci
+        disp_recession = sm_recession      if sm_recession      is not None else recession_ratio
 
-        # 평활화된 ratio로 심각도 재분류
-        if disp_ratio is not None:
-            sev_label, sev_level, sev_color = classify_severity(disp_ratio)
+        # ── 3개 신호 중 가장 심한 것으로 분류 ────────────────────────────
+        m_label, combined_level = classify_baldness(
+            disp_m_index, disp_ratio, disp_hci
+        )
+        sev_color = LEVEL_COLORS[combined_level] if 0 <= combined_level <= 3 else (120, 120, 120)
+        # 통합 점수 (시계열용): 각 신호의 정규화된 max
+        amp_n = (disp_m_index or 0) / 0.30
+        fhd_n = max(0.0, (disp_ratio or 0.50) - 0.50) / 0.28
+        bld_n = max(0.0, 0.75 - (disp_hci if disp_hci is not None else 1.0)) / 0.40
+        combined_score = round(max(amp_n, fhd_n, bld_n), 3)
 
         # 헤어라인 ↔ 눈썹 가이드 라인 (캡처 모드)
         if hairline_y is not None:
@@ -651,12 +621,6 @@ def process_frame(frame: np.ndarray, frame_idx: int, live_only: bool = True):
                      (eb_mid_x, int(eyebrow_y)),
                      (eb_mid_x, int(hairline_y)),
                      sev_color, 2, cv2.LINE_AA)
-
-        # 단독 판단 (M자만 / 이마만)
-        m_only_label, m_only_level         = classify_m_only(disp_m_index)
-        forehead_label, forehead_level     = classify_forehead_only(disp_ratio)
-        # 종합 판단 (M자 + 이마)
-        m_label, combined_level, combined_score = classify_combined(disp_m_index, disp_ratio)
 
         # ── 메타데이터 ───────────────────────────────────────────────────
         hairline_y_norm = None
@@ -668,38 +632,33 @@ def process_frame(frame: np.ndarray, frame_idx: int, live_only: bool = True):
         detections.append({
             "id": face_idx,
             "bbox": [x1, y1, x2, y2],
-            "confidence": 1.0,
-            "hairline_points": len(final_hairline),
-            "hairline_y_normalized": hairline_y_norm,
-            "eyebrow_angle": round(float(eb_angle), 2),
-            "is_level": bool(is_level),
-            # 원본 (현재 프레임)
-            "forehead_px":     round(forehead_px, 1),
+            # 표시용 raw 값
             "forehead_mm":     forehead_mm,
-            "ipd_px":          round(ipd_px, 1) if ipd_px is not None else None,
+            "forehead_px":     round(forehead_px, 1),
             "forehead_ratio":  round(ratio, 3) if ratio is not None else None,
-            "severity":        sev_label,
-            "severity_level":  sev_level,
+            "ipd_px":          round(ipd_px, 1) if ipd_px is not None else None,
             "m_index":         m_index,
-            "m_only_label":    m_only_label,        # M자 단독 ("정상" / "경증" / ...)
-            "m_only_level":    m_only_level,
-            "forehead_label":  forehead_label,      # 이마 단독 ("정상" / "경증" / ...)
-            "forehead_level":  forehead_level,
-            "m_label":         m_label,             # 종합 판단 ("경증 M자" / "중등도 이마후퇴" / ...)
-            "combined_score":  combined_score,
-            "combined_level":  combined_level,
             "hci":             hci,
-            # 안정화 (최근 8프레임 중앙값) — 측정 기록에 쓰는 값
+            # 단일 분류 결과 (탈모 여부)
+            "recession_ratio": recession_ratio,
+            "m_label":         m_label,           # "정상" / "경증" / "중등도" / "심각"
+            "combined_score":  combined_score,    # = recession_ratio (호환성용)
+            "combined_level":  combined_level,
+            # 안정화 (smooth window 중앙값)
             "forehead_mm_smooth":    round(sm_forehead_mm, 1) if sm_forehead_mm is not None else None,
             "forehead_ratio_smooth": round(sm_forehead_ratio, 3) if sm_forehead_ratio is not None else None,
             "m_index_smooth":        round(sm_m_index, 3) if sm_m_index is not None else None,
             "hci_smooth":            round(sm_hci, 3) if sm_hci is not None else None,
-            # 정렬 상태 (numpy.bool_ → Python bool 변환 필수, JSON 직렬화 위해)
+            "recession_smooth":      round(sm_recession, 3) if sm_recession is not None else None,
+            # 정렬 상태
             "aligned":      bool(aligned),
             "align_center": bool(center_ok),
             "align_size":   bool(size_ok),
             "align_level":  bool(level_ok),
             "align_yaw":    bool(yaw_ok),
+            # eyebrow info (UI 호환)
+            "eyebrow_angle": round(float(eb_angle), 2),
+            "is_level":      bool(is_level),
         })
 
     return frame, detections
