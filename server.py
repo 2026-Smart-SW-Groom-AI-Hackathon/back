@@ -11,13 +11,6 @@ import asyncio
 import sys
 import traceback
 
-# Windows PowerShell에서 print/log이 버퍼링돼서 안 보이는 문제 방지 — 라인 단위 flush 강제
-try:
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
-except Exception:
-    pass
-
 # stdout 즉시 flush — 부팅 중 죽을 때 메시지 잘리는 것 방지
 # (stderr.flush()는 mediapipe가 fd를 건드려서 Windows에서 OSError 발생 가능 → 호출 금지)
 def _p(msg):
@@ -44,25 +37,12 @@ try:
     from mediapipe.tasks import python as mp_tasks
     from mediapipe.tasks.python import vision as mp_vision
     _p("[boot] mediapipe.tasks loaded")
-
-    # Claude API (선택) — 키 없거나 SDK 미설치면 비활성화하고 클라 폴백 사용
-    try:
-        import anthropic
-        _p(f"[boot] anthropic SDK {getattr(anthropic, '__version__', '?')} loaded")
-    except ImportError:
-        anthropic = None
-        _p("[boot] anthropic SDK 미설치 → AI 리포트 비활성화 (pip install anthropic 으로 활성화)")
 except Exception as e:
     _p(f"[boot] IMPORT FAILED: {type(e).__name__}: {e}")
     traceback.print_exc()
     sys.exit(1)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(message)s",
-    datefmt="%H:%M:%S",
-    stream=sys.stdout,   # 기본 stderr → stdout으로 (Windows PowerShell에서 더 잘 보임)
-)
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("HairLens")
 
 # ── Config ─────────────────────────────────────────────────────────────────
@@ -261,21 +241,6 @@ def make_thumb_b64(image_filename: str) -> str:
     return b64
 
 
-def attach_image_b64(rec: dict) -> dict:
-    """rec에 디스크 스냅샷의 풀-사이즈 base64를 붙여서 반환 (영속화엔 사용 안 함)."""
-    fname = rec.get("image", "")
-    if not fname:
-        return rec
-    path = os.path.join(SNAPSHOTS_DIR, fname)
-    if not os.path.exists(path):
-        return rec
-    try:
-        with open(path, "rb") as f:
-            return {**rec, "image_b64": base64.b64encode(f.read()).decode()}
-    except OSError:
-        return rec
-
-
 def save_measurement(detection: dict, frame: np.ndarray = None, ts: float = None) -> dict:
     if ts is None:
         ts = time.time()
@@ -328,11 +293,12 @@ def load_history(limit: int = HISTORY_LIMIT, with_thumbs: bool = True) -> list:
             it["thumb"] = make_thumb_b64(it.get("image", ""))
     return items
 
-# ── 탈모 색상 (3단계: 정상 / 중등도 / 심각) ──────────────────────────────
+# ── 탈모 색상 (4단계) ────────────────────────────────────────────────────
 LEVEL_COLORS = [
     (0, 255, 120),   # 0 정상
-    (0, 140, 255),   # 1 중등도
-    (0,  60, 255),   # 2 심각
+    (0, 220, 255),   # 1 경증
+    (0, 140, 255),   # 2 중등도
+    (0,  60, 255),   # 3 심각
 ]
 
 # ── 색상 ────────────────────────────────────────────────────────────────────
@@ -363,29 +329,29 @@ def classify_baldness(m_index, forehead_ratio, hci):
     """
     levels = []
 
-    # 3단계 분류: 정상 / 중등도 / 심각
-    # (이전 정상+경증 → 정상으로 통합, 심각 범위 살짝 확장)
-
     if m_index is not None:
-        if   m_index < 0.42: levels.append(0)   # 정상 (이전 정상 + 경증)
-        elif m_index < 0.50: levels.append(1)   # 중등도
-        else:                levels.append(2)   # 심각 (≥0.50, 이전 0.52)
+        if   m_index < 0.25: levels.append(0)
+        elif m_index < 0.38: levels.append(1)
+        elif m_index < 0.50: levels.append(2)
+        else:                levels.append(3)
 
     if forehead_ratio is not None:
-        if   forehead_ratio < 0.77: levels.append(0)
-        elif forehead_ratio < 0.88: levels.append(1)
-        else:                       levels.append(2)   # ≥0.88, 이전 0.91
+        if   forehead_ratio < 0.47: levels.append(0)
+        elif forehead_ratio < 0.57: levels.append(1)
+        elif forehead_ratio < 0.72: levels.append(2)
+        else:                       levels.append(3)
 
     if hci is not None:
-        if   hci > 0.52: levels.append(0)
-        elif hci > 0.35: levels.append(1)
-        else:            levels.append(2)   # ≤0.35, 이전 0.32
+        if   hci > 0.75: levels.append(0)
+        elif hci > 0.55: levels.append(1)
+        elif hci > 0.35: levels.append(2)
+        else:            levels.append(3)   # HCI < 0.35 = 대머리
 
     if not levels:
         return "—", -1
 
     lvl = max(levels)
-    return ["정상", "중등도", "심각"][lvl], lvl
+    return ["정상", "경증", "중등도", "심각"][lvl], lvl
 
 
 def get_px(lm, w, h):
@@ -642,10 +608,10 @@ def process_frame(frame: np.ndarray, frame_idx: int, live_only: bool = True):
             disp_m_index, disp_ratio, disp_hci
         )
         sev_color = LEVEL_COLORS[combined_level] if 0 <= combined_level <= 3 else (120, 120, 120)
-        # 통합 점수 (시계열용): 각 신호의 정규화된 max (1.0 = 심각 임계)
-        amp_n = max(0.0, (disp_m_index or 0) - 0.30) / 0.20      # 0.30~0.50 → 0~1
-        fhd_n = max(0.0, (disp_ratio or 0.50) - 0.50) / 0.38     # 0.50~0.88 → 0~1
-        bld_n = max(0.0, 0.72 - (disp_hci if disp_hci is not None else 1.0)) / 0.37
+        # 통합 점수 (시계열용): 각 신호의 정규화된 max
+        amp_n = (disp_m_index or 0) / 0.30
+        fhd_n = max(0.0, (disp_ratio or 0.50) - 0.50) / 0.28
+        bld_n = max(0.0, 0.75 - (disp_hci if disp_hci is not None else 1.0)) / 0.40
         combined_score = round(max(amp_n, fhd_n, bld_n), 3)
 
         # 헤어라인 ↔ 눈썹 가이드 라인 (캡처 모드)
@@ -695,15 +661,6 @@ def process_frame(frame: np.ndarray, frame_idx: int, live_only: bool = True):
             "is_level":      bool(is_level),
         })
 
-    # 여러 명이 잡혔을 때 가이드 중심에 가장 가까운 얼굴이 [0]번이 되도록 정렬.
-    # → 화면 중앙에 정렬한 사람만 자동 캡처 대상이 됨.
-    if len(detections) > 1:
-        def _dist_to_guide(d):
-            x1, y1, x2, y2 = d["bbox"]
-            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-            return (cx - g_cx) ** 2 + (cy - g_cy) ** 2
-        detections.sort(key=_dist_to_guide)
-
     return frame, detections
 
 
@@ -712,24 +669,16 @@ async def stream_to_client(websocket):
     addr = websocket.remote_address
     log.info(f"Client connected: {addr}")
 
-    # Windows CAP_DSHOW가 기본 MSMF보다 5-10배 빠르게 열림.
-    # 직전 release가 완전히 풀리기 전에 새 연결이 오면 잠겨있을 수 있음 → 짧게 재시도.
-    cap = None
-    for attempt in range(3):
-        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
-        if cap.isOpened():
-            break
-        cap.release()
-        log.warning(f"카메라 열기 재시도 {attempt+1}/3")
-        await asyncio.sleep(0.4)
-    if cap is None or not cap.isOpened():
+    # Windows에서 CAP_DSHOW가 기본 MSMF보다 5-10배 빠르게 열림
+    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        # 폴백: 기본 백엔드
         log.warning("CAP_DSHOW 실패 → 기본 백엔드 시도")
         cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
         log.error("카메라를 열 수 없습니다!")
         await websocket.send(json.dumps({"error": "Camera not available"}))
         return
-    log.info(f"📷 camera opened (backend={int(cap.getBackendName() != '')})")
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -752,30 +701,14 @@ async def stream_to_client(websocket):
 
     async def send_loop():
         frame_idx = 0
-        fail_count = 0
         interval  = 1.0 / TARGET_FPS
         loop      = asyncio.get_event_loop()
         while True:
             t0 = time.monotonic()
             ret, frame = cap.read()
             if not ret:
-                fail_count += 1
-                if fail_count == 1 or fail_count % 30 == 0:
-                    log.warning(f"⚠ cap.read() False (n={fail_count}) — 카메라가 다른 프로그램에 점유되었거나 끊김")
-                if fail_count >= 60:
-                    log.error("카메라 연속 60회 read 실패 → 재오픈 시도")
-                    try:
-                        cap.release()
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.5)
-                    cap.open(CAMERA_INDEX, cv2.CAP_DSHOW)
-                    fail_count = 0
                 await asyncio.sleep(0.05)
                 continue
-            if fail_count > 0:
-                log.info(f"✓ cap.read() recovered after {fail_count} failures")
-                fail_count = 0
 
             frame = cv2.flip(frame, 1)
             raw_frame = frame.copy()  # 캡처 시 풀 처리용으로 보관
@@ -790,8 +723,6 @@ async def stream_to_client(websocket):
                 state["last_annotated"] = annotated
 
             # ── 자동 캡처 카운터 ────────────────────────────────────────
-            # detections는 process_frame에서 가이드 중심에 가까운 순으로 정렬됨 →
-            # 여러 명이 있어도 가운데 정렬된 사람만 측정됨
             auto_event = None
             if state["cooldown"] > 0:
                 state["cooldown"] -= 1
@@ -807,9 +738,13 @@ async def stream_to_client(websocket):
                         full_det = full_dets[0] if full_dets else detections[0]
                         rec = save_measurement(full_det, frame=full_annotated)
                         log.info(f"[auto] saved hci={rec.get('hci')} mm={rec.get('forehead_mm')} m={rec.get('m_index')}")
+                        # 저장 이미지 즉시 동봉 → 클라이언트 추가 요청 불필요
+                        ok_enc, full_buf = cv2.imencode(".jpg", full_annotated, [cv2.IMWRITE_JPEG_QUALITY, 88])
+                        full_b64 = base64.b64encode(full_buf).decode() if ok_enc else ""
                         auto_event = {
                             "type":  "auto_saved",
-                            "saved": attach_image_b64(rec),
+                            "saved": rec,
+                            "image_b64": full_b64,
                             "items": load_history(),
                         }
                     except Exception as e:
@@ -879,10 +814,13 @@ async def stream_to_client(websocket):
                     full_det = full_dets[0] if full_dets else (state.get("last_detection") or {})
                     rec = save_measurement(full_det, frame=full_annotated)
                     log.info(f"saved: hci={rec.get('hci')} mm={rec.get('forehead_mm')}")
+                    ok_enc, full_buf = cv2.imencode(".jpg", full_annotated, [cv2.IMWRITE_JPEG_QUALITY, 88])
+                    full_b64 = base64.b64encode(full_buf).decode() if ok_enc else ""
                     await websocket.send(json.dumps({
                         "type":  "history",
                         "items": load_history(),
-                        "saved": attach_image_b64(rec),
+                        "saved": rec,
+                        "image_b64": full_b64,
                     }))
                 else:
                     await websocket.send(json.dumps({
@@ -926,7 +864,6 @@ async def stream_to_client(websocket):
         log.error(f"Error: {e}", exc_info=True)
     finally:
         cap.release()
-        log.info(f"📷 camera released ({addr})")
 
 
 async def main():
