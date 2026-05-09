@@ -293,12 +293,11 @@ def load_history(limit: int = HISTORY_LIMIT, with_thumbs: bool = True) -> list:
             it["thumb"] = make_thumb_b64(it.get("image", ""))
     return items
 
-# ── 탈모 색상 (4단계) ────────────────────────────────────────────────────
+# ── 탈모 색상 (3단계: 정상 / 중등도 / 심각) ──────────────────────────────
 LEVEL_COLORS = [
     (0, 255, 120),   # 0 정상
-    (0, 220, 255),   # 1 경증
-    (0, 140, 255),   # 2 중등도
-    (0,  60, 255),   # 3 심각
+    (0, 140, 255),   # 1 중등도
+    (0,  60, 255),   # 2 심각
 ]
 
 # ── 색상 ────────────────────────────────────────────────────────────────────
@@ -329,29 +328,29 @@ def classify_baldness(m_index, forehead_ratio, hci):
     """
     levels = []
 
+    # 3단계 분류: 정상 / 중등도 / 심각
+    # (이전 정상+경증 → 정상으로 통합, 심각 범위 살짝 확장)
+
     if m_index is not None:
-        if   m_index < 0.10: levels.append(0)
-        elif m_index < 0.20: levels.append(1)
-        elif m_index < 0.35: levels.append(2)
-        else:                levels.append(3)
+        if   m_index < 0.42: levels.append(0)   # 정상 (이전 정상 + 경증)
+        elif m_index < 0.50: levels.append(1)   # 중등도
+        else:                levels.append(2)   # 심각 (≥0.50, 이전 0.52)
 
     if forehead_ratio is not None:
-        if   forehead_ratio < 0.55: levels.append(0)
-        elif forehead_ratio < 0.65: levels.append(1)
-        elif forehead_ratio < 0.78: levels.append(2)
-        else:                       levels.append(3)
+        if   forehead_ratio < 0.77: levels.append(0)
+        elif forehead_ratio < 0.88: levels.append(1)
+        else:                       levels.append(2)   # ≥0.88, 이전 0.91
 
     if hci is not None:
-        if   hci > 0.75: levels.append(0)
-        elif hci > 0.55: levels.append(1)
-        elif hci > 0.35: levels.append(2)
-        else:            levels.append(3)   # HCI < 0.35 = 대머리
+        if   hci > 0.52: levels.append(0)
+        elif hci > 0.35: levels.append(1)
+        else:            levels.append(2)   # ≤0.35, 이전 0.32
 
     if not levels:
         return "—", -1
 
     lvl = max(levels)
-    return ["정상", "경증", "중등도", "심각"][lvl], lvl
+    return ["정상", "중등도", "심각"][lvl], lvl
 
 
 def get_px(lm, w, h):
@@ -608,10 +607,10 @@ def process_frame(frame: np.ndarray, frame_idx: int, live_only: bool = True):
             disp_m_index, disp_ratio, disp_hci
         )
         sev_color = LEVEL_COLORS[combined_level] if 0 <= combined_level <= 3 else (120, 120, 120)
-        # 통합 점수 (시계열용): 각 신호의 정규화된 max
-        amp_n = (disp_m_index or 0) / 0.30
-        fhd_n = max(0.0, (disp_ratio or 0.50) - 0.50) / 0.28
-        bld_n = max(0.0, 0.75 - (disp_hci if disp_hci is not None else 1.0)) / 0.40
+        # 통합 점수 (시계열용): 각 신호의 정규화된 max (1.0 = 심각 임계)
+        amp_n = max(0.0, (disp_m_index or 0) - 0.30) / 0.20      # 0.30~0.50 → 0~1
+        fhd_n = max(0.0, (disp_ratio or 0.50) - 0.50) / 0.38     # 0.50~0.88 → 0~1
+        bld_n = max(0.0, 0.72 - (disp_hci if disp_hci is not None else 1.0)) / 0.37
         combined_score = round(max(amp_n, fhd_n, bld_n), 3)
 
         # 헤어라인 ↔ 눈썹 가이드 라인 (캡처 모드)
