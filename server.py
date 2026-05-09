@@ -26,33 +26,6 @@ def _p(msg):
     except OSError:
         pass
 
-# .env 자동 로드 (별도 의존성 없음 — KEY=VALUE 형식만 처리)
-def _load_dotenv():
-    import os as _os
-    here = _os.path.dirname(_os.path.abspath(__file__))
-    path = _os.path.join(here, ".env")
-    if not _os.path.exists(path):
-        return False
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                k, v = k.strip(), v.strip()
-                # 따옴표 벗기기
-                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
-                    v = v[1:-1]
-                # 이미 환경변수에 있으면 덮어쓰지 않음
-                _os.environ.setdefault(k, v)
-        return True
-    except OSError:
-        return False
-
-if _load_dotenv():
-    _p("[boot] .env 로드됨")
-
 _p("[boot] importing modules...")
 try:
     import websockets
@@ -286,84 +259,6 @@ def make_thumb_b64(image_filename: str) -> str:
         _thumb_cache.pop(next(iter(_thumb_cache)))
     _thumb_cache[image_filename] = b64
     return b64
-
-
-# ── Claude API 리포트 생성 ──────────────────────────────────────────────
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6").strip()
-_claude_client    = None
-if anthropic and ANTHROPIC_API_KEY:
-    try:
-        _claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        _p(f"[boot] Claude client ready (model={CLAUDE_MODEL})")
-    except Exception as e:
-        _p(f"[boot] Claude client init failed: {e}")
-        _claude_client = None
-else:
-    if not ANTHROPIC_API_KEY:
-        _p("[boot] ANTHROPIC_API_KEY 미설정 → AI 리포트 비활성화")
-
-REPORT_SYSTEM_PROMPT = """당신은 한국어 탈모 진단 리포트 작성 전문가입니다.
-사용자의 설문(가족력/약물/자가 진단)과 카메라 측정값(HCI, M-index, 이마 mm, 진행 단계)을 받아
-공감적이지만 정확한 톤으로 개인화 리포트를 JSON으로 작성합니다. 의학적 단정은 피하고,
-"~할 가능성", "~경향" 같은 표현을 사용하세요. 권장사항은 검증된 일반 가이드라인 수준만 제시하세요.
-
-응답 형식 — 반드시 다음 키를 가진 JSON 한 개만 출력하세요. 추가 텍스트 금지:
-{
-  "total_score": 0~100 정수,
-  "stage_text": "정상 범위" | "중등도 진행" | "심각 진행" 등 한 줄,
-  "one_line_summary": 한 줄 요약 (40~80자),
-  "full_report": 3~5문장 종합 분석 (말투는 친근하면서 신뢰감 있게),
-  "key_insights": ["측정/설문 기반 핵심 발견 5개"],
-  "recommendations": [{"title": "...", "desc": "..."}, ... 4~6개],
-  "future_3months": "한두 문장",
-  "future_6months": "한두 문장",
-  "visual_tips": ["즉효성 외형 팁 4~5개"],
-  "risk_factors": ["개인 위험 요인 3~5개"]
-}"""
-
-
-def _build_user_prompt(survey: dict, measurement: dict) -> str:
-    return (
-        "# 입력 데이터\n\n"
-        f"## 설문\n{json.dumps(survey, ensure_ascii=False, indent=2)}\n\n"
-        f"## 측정값\n{json.dumps(measurement, ensure_ascii=False, indent=2)}\n\n"
-        "위 데이터를 바탕으로 시스템 프롬프트의 형식에 맞춰 JSON 리포트를 출력하세요."
-    )
-
-
-def _generate_ai_report_sync(survey: dict, measurement: dict) -> dict | None:
-    """Claude API로 리포트 생성. 실패 시 None."""
-    if _claude_client is None:
-        return None
-    try:
-        msg = _claude_client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=2000,
-            system=[{
-                "type": "text",
-                "text": REPORT_SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},   # 시스템 프롬프트 캐싱 (반복 호출 비용 절감)
-            }],
-            messages=[{"role": "user", "content": _build_user_prompt(survey, measurement)}],
-        )
-        text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
-        # 모델이 ```json ... ``` 펜스를 두를 수 있어 안전하게 벗기기
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text
-            if text.endswith("```"):
-                text = text.rsplit("```", 1)[0]
-        return json.loads(text.strip())
-    except Exception as e:
-        log.warning(f"Claude 리포트 생성 실패: {type(e).__name__}: {e}")
-        return None
-
-
-async def generate_ai_report(survey: dict, measurement: dict) -> dict | None:
-    """비동기 래퍼 — 메인 이벤트 루프 막지 않도록 executor에서 실행."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _generate_ai_report_sync, survey, measurement)
 
 
 def attach_image_b64(rec: dict) -> dict:
@@ -1003,26 +898,6 @@ async def stream_to_client(websocket):
                 state["auto_enabled"] = bool(cmd.get("enabled", True))
                 state["aligned_frames"] = 0
                 log.info(f"auto-capture: {'ON' if state['auto_enabled'] else 'OFF'}")
-            elif ctype == "build_report":
-                req_id = cmd.get("req_id")
-                survey = cmd.get("survey") or {}
-                measurement = cmd.get("measurement") or {}
-                if _claude_client is None:
-                    await websocket.send(json.dumps({
-                        "type":   "report",
-                        "req_id": req_id,
-                        "report": None,
-                        "error":  "AI report disabled (no API key or SDK)",
-                    }))
-                else:
-                    log.info(f"[ai] generating report (req_id={req_id})")
-                    report = await generate_ai_report(survey, measurement)
-                    log.info(f"[ai] report {'생성됨' if report else '실패'}")
-                    await websocket.send(json.dumps({
-                        "type":   "report",
-                        "req_id": req_id,
-                        "report": report,
-                    }))
             elif ctype == "snapshot":
                 fname = (cmd.get("file") or "").strip()
                 # 경로 트래버설 방어: 파일명에 슬래시/dot-segment 금지
