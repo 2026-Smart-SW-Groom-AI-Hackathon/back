@@ -11,6 +11,13 @@ import asyncio
 import sys
 import traceback
 
+# Windows PowerShell에서 print/log이 버퍼링돼서 안 보이는 문제 방지 — 라인 단위 flush 강제
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 # stdout 즉시 flush — 부팅 중 죽을 때 메시지 잘리는 것 방지
 # (stderr.flush()는 mediapipe가 fd를 건드려서 Windows에서 OSError 발생 가능 → 호출 금지)
 def _p(msg):
@@ -18,6 +25,33 @@ def _p(msg):
         print(msg, flush=True)
     except OSError:
         pass
+
+# .env 자동 로드 (별도 의존성 없음 — KEY=VALUE 형식만 처리)
+def _load_dotenv():
+    import os as _os
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    path = _os.path.join(here, ".env")
+    if not _os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                # 따옴표 벗기기
+                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                    v = v[1:-1]
+                # 이미 환경변수에 있으면 덮어쓰지 않음
+                _os.environ.setdefault(k, v)
+        return True
+    except OSError:
+        return False
+
+if _load_dotenv():
+    _p("[boot] .env 로드됨")
 
 _p("[boot] importing modules...")
 try:
@@ -37,12 +71,25 @@ try:
     from mediapipe.tasks import python as mp_tasks
     from mediapipe.tasks.python import vision as mp_vision
     _p("[boot] mediapipe.tasks loaded")
+
+    # Claude API (선택) — 키 없거나 SDK 미설치면 비활성화하고 클라 폴백 사용
+    try:
+        import anthropic
+        _p(f"[boot] anthropic SDK {getattr(anthropic, '__version__', '?')} loaded")
+    except ImportError:
+        anthropic = None
+        _p("[boot] anthropic SDK 미설치 → AI 리포트 비활성화 (pip install anthropic 으로 활성화)")
 except Exception as e:
     _p(f"[boot] IMPORT FAILED: {type(e).__name__}: {e}")
     traceback.print_exc()
     sys.exit(1)
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stdout,   # 기본 stderr → stdout으로 (Windows PowerShell에서 더 잘 보임)
+)
 log = logging.getLogger("HairLens")
 
 # ── Config ─────────────────────────────────────────────────────────────────
@@ -239,6 +286,99 @@ def make_thumb_b64(image_filename: str) -> str:
         _thumb_cache.pop(next(iter(_thumb_cache)))
     _thumb_cache[image_filename] = b64
     return b64
+
+
+# ── Claude API 리포트 생성 ──────────────────────────────────────────────
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6").strip()
+_claude_client    = None
+if anthropic and ANTHROPIC_API_KEY:
+    try:
+        _claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        _p(f"[boot] Claude client ready (model={CLAUDE_MODEL})")
+    except Exception as e:
+        _p(f"[boot] Claude client init failed: {e}")
+        _claude_client = None
+else:
+    if not ANTHROPIC_API_KEY:
+        _p("[boot] ANTHROPIC_API_KEY 미설정 → AI 리포트 비활성화")
+
+REPORT_SYSTEM_PROMPT = """당신은 한국어 탈모 진단 리포트 작성 전문가입니다.
+사용자의 설문(가족력/약물/자가 진단)과 카메라 측정값(HCI, M-index, 이마 mm, 진행 단계)을 받아
+공감적이지만 정확한 톤으로 개인화 리포트를 JSON으로 작성합니다. 의학적 단정은 피하고,
+"~할 가능성", "~경향" 같은 표현을 사용하세요. 권장사항은 검증된 일반 가이드라인 수준만 제시하세요.
+
+응답 형식 — 반드시 다음 키를 가진 JSON 한 개만 출력하세요. 추가 텍스트 금지:
+{
+  "total_score": 0~100 정수,
+  "stage_text": "정상 범위" | "중등도 진행" | "심각 진행" 등 한 줄,
+  "one_line_summary": 한 줄 요약 (40~80자),
+  "full_report": 3~5문장 종합 분석 (말투는 친근하면서 신뢰감 있게),
+  "key_insights": ["측정/설문 기반 핵심 발견 5개"],
+  "recommendations": [{"title": "...", "desc": "..."}, ... 4~6개],
+  "future_3months": "한두 문장",
+  "future_6months": "한두 문장",
+  "visual_tips": ["즉효성 외형 팁 4~5개"],
+  "risk_factors": ["개인 위험 요인 3~5개"]
+}"""
+
+
+def _build_user_prompt(survey: dict, measurement: dict) -> str:
+    return (
+        "# 입력 데이터\n\n"
+        f"## 설문\n{json.dumps(survey, ensure_ascii=False, indent=2)}\n\n"
+        f"## 측정값\n{json.dumps(measurement, ensure_ascii=False, indent=2)}\n\n"
+        "위 데이터를 바탕으로 시스템 프롬프트의 형식에 맞춰 JSON 리포트를 출력하세요."
+    )
+
+
+def _generate_ai_report_sync(survey: dict, measurement: dict) -> dict | None:
+    """Claude API로 리포트 생성. 실패 시 None."""
+    if _claude_client is None:
+        return None
+    try:
+        msg = _claude_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=2000,
+            system=[{
+                "type": "text",
+                "text": REPORT_SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},   # 시스템 프롬프트 캐싱 (반복 호출 비용 절감)
+            }],
+            messages=[{"role": "user", "content": _build_user_prompt(survey, measurement)}],
+        )
+        text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+        # 모델이 ```json ... ``` 펜스를 두를 수 있어 안전하게 벗기기
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text
+            if text.endswith("```"):
+                text = text.rsplit("```", 1)[0]
+        return json.loads(text.strip())
+    except Exception as e:
+        log.warning(f"Claude 리포트 생성 실패: {type(e).__name__}: {e}")
+        return None
+
+
+async def generate_ai_report(survey: dict, measurement: dict) -> dict | None:
+    """비동기 래퍼 — 메인 이벤트 루프 막지 않도록 executor에서 실행."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _generate_ai_report_sync, survey, measurement)
+
+
+def attach_image_b64(rec: dict) -> dict:
+    """rec에 디스크 스냅샷의 풀-사이즈 base64를 붙여서 반환 (영속화엔 사용 안 함)."""
+    fname = rec.get("image", "")
+    if not fname:
+        return rec
+    path = os.path.join(SNAPSHOTS_DIR, fname)
+    if not os.path.exists(path):
+        return rec
+    try:
+        with open(path, "rb") as f:
+            return {**rec, "image_b64": base64.b64encode(f.read()).decode()}
+    except OSError:
+        return rec
 
 
 def save_measurement(detection: dict, frame: np.ndarray = None, ts: float = None) -> dict:
@@ -660,6 +800,15 @@ def process_frame(frame: np.ndarray, frame_idx: int, live_only: bool = True):
             "is_level":      bool(is_level),
         })
 
+    # 여러 명이 잡혔을 때 가이드 중심에 가장 가까운 얼굴이 [0]번이 되도록 정렬.
+    # → 화면 중앙에 정렬한 사람만 자동 캡처 대상이 됨.
+    if len(detections) > 1:
+        def _dist_to_guide(d):
+            x1, y1, x2, y2 = d["bbox"]
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            return (cx - g_cx) ** 2 + (cy - g_cy) ** 2
+        detections.sort(key=_dist_to_guide)
+
     return frame, detections
 
 
@@ -668,16 +817,24 @@ async def stream_to_client(websocket):
     addr = websocket.remote_address
     log.info(f"Client connected: {addr}")
 
-    # Windows에서 CAP_DSHOW가 기본 MSMF보다 5-10배 빠르게 열림
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        # 폴백: 기본 백엔드
+    # Windows CAP_DSHOW가 기본 MSMF보다 5-10배 빠르게 열림.
+    # 직전 release가 완전히 풀리기 전에 새 연결이 오면 잠겨있을 수 있음 → 짧게 재시도.
+    cap = None
+    for attempt in range(3):
+        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            break
+        cap.release()
+        log.warning(f"카메라 열기 재시도 {attempt+1}/3")
+        await asyncio.sleep(0.4)
+    if cap is None or not cap.isOpened():
         log.warning("CAP_DSHOW 실패 → 기본 백엔드 시도")
         cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
         log.error("카메라를 열 수 없습니다!")
         await websocket.send(json.dumps({"error": "Camera not available"}))
         return
+    log.info(f"📷 camera opened (backend={int(cap.getBackendName() != '')})")
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -700,14 +857,30 @@ async def stream_to_client(websocket):
 
     async def send_loop():
         frame_idx = 0
+        fail_count = 0
         interval  = 1.0 / TARGET_FPS
         loop      = asyncio.get_event_loop()
         while True:
             t0 = time.monotonic()
             ret, frame = cap.read()
             if not ret:
+                fail_count += 1
+                if fail_count == 1 or fail_count % 30 == 0:
+                    log.warning(f"⚠ cap.read() False (n={fail_count}) — 카메라가 다른 프로그램에 점유되었거나 끊김")
+                if fail_count >= 60:
+                    log.error("카메라 연속 60회 read 실패 → 재오픈 시도")
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.5)
+                    cap.open(CAMERA_INDEX, cv2.CAP_DSHOW)
+                    fail_count = 0
                 await asyncio.sleep(0.05)
                 continue
+            if fail_count > 0:
+                log.info(f"✓ cap.read() recovered after {fail_count} failures")
+                fail_count = 0
 
             frame = cv2.flip(frame, 1)
             raw_frame = frame.copy()  # 캡처 시 풀 처리용으로 보관
@@ -722,6 +895,8 @@ async def stream_to_client(websocket):
                 state["last_annotated"] = annotated
 
             # ── 자동 캡처 카운터 ────────────────────────────────────────
+            # detections는 process_frame에서 가이드 중심에 가까운 순으로 정렬됨 →
+            # 여러 명이 있어도 가운데 정렬된 사람만 측정됨
             auto_event = None
             if state["cooldown"] > 0:
                 state["cooldown"] -= 1
@@ -739,7 +914,7 @@ async def stream_to_client(websocket):
                         log.info(f"[auto] saved hci={rec.get('hci')} mm={rec.get('forehead_mm')} m={rec.get('m_index')}")
                         auto_event = {
                             "type":  "auto_saved",
-                            "saved": rec,
+                            "saved": attach_image_b64(rec),
                             "items": load_history(),
                         }
                     except Exception as e:
@@ -812,7 +987,7 @@ async def stream_to_client(websocket):
                     await websocket.send(json.dumps({
                         "type":  "history",
                         "items": load_history(),
-                        "saved": rec,
+                        "saved": attach_image_b64(rec),
                     }))
                 else:
                     await websocket.send(json.dumps({
@@ -828,6 +1003,26 @@ async def stream_to_client(websocket):
                 state["auto_enabled"] = bool(cmd.get("enabled", True))
                 state["aligned_frames"] = 0
                 log.info(f"auto-capture: {'ON' if state['auto_enabled'] else 'OFF'}")
+            elif ctype == "build_report":
+                req_id = cmd.get("req_id")
+                survey = cmd.get("survey") or {}
+                measurement = cmd.get("measurement") or {}
+                if _claude_client is None:
+                    await websocket.send(json.dumps({
+                        "type":   "report",
+                        "req_id": req_id,
+                        "report": None,
+                        "error":  "AI report disabled (no API key or SDK)",
+                    }))
+                else:
+                    log.info(f"[ai] generating report (req_id={req_id})")
+                    report = await generate_ai_report(survey, measurement)
+                    log.info(f"[ai] report {'생성됨' if report else '실패'}")
+                    await websocket.send(json.dumps({
+                        "type":   "report",
+                        "req_id": req_id,
+                        "report": report,
+                    }))
             elif ctype == "snapshot":
                 fname = (cmd.get("file") or "").strip()
                 # 경로 트래버설 방어: 파일명에 슬래시/dot-segment 금지
@@ -856,6 +1051,7 @@ async def stream_to_client(websocket):
         log.error(f"Error: {e}", exc_info=True)
     finally:
         cap.release()
+        log.info(f"📷 camera released ({addr})")
 
 
 async def main():
